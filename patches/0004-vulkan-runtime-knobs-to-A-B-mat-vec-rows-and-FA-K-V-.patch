@@ -1,0 +1,78 @@
+From 79ae867aef08bb13c733683e0c83e9f4cb66803e Mon Sep 17 00:00:00 2001
+From: chokob0 <services@jworks.es>
+Date: Tue, 17 Nov 2026 00:01:00 +0100
+Subject: [PATCH 4/4] vulkan: runtime knobs to A/B mat-vec rows and FA K/V
+ staging
+
+GGML_VK_RM_STDQ=<1..8>, GGML_VK_RM_KQ=<1..16>, GGML_VK_RM_IQ=<1..16> and
+GGML_VK_FA_SHMEM_STAGING=<0|1>, read once at pipeline creation. Forced staging
+is still dropped by the upstream fit check (#32244).
+
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 36 ++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 4a6ca10aa..778dd6b48 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1206,6 +1206,22 @@ void ggml_vk_wait_events(vk_context& ctx, std::vector<vk::Event>&& events) {
+     );
+ }
+ 
++// Read a small unsigned tuning value from the environment (bc250 tuning knobs).
++// Returns -1 when the variable is unset or outside [lo, hi] (a warning is logged for the latter).
++static int ggml_vk_env_uint(const char * name, int lo, int hi) {
++    const char * env = getenv(name);
++    if (env == nullptr || *env == '\0') {
++        return -1;
++    }
++    char * end = nullptr;
++    const long v = strtol(env, &end, 10);
++    if (end == env || *end != '\0' || v < lo || v > hi) {
++        GGML_LOG_WARN("ggml_vulkan: ignoring %s=%s (expected an integer in [%d, %d])\n", name, env, lo, hi);
++        return -1;
++    }
++    return (int) v;
++}
++
+ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
+ 
+     vk_fa_tuning_params result{};
+@@ -1264,6 +1280,12 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device,
+     const bool amd_rdna = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN;
+     result.shmem_staging = ((device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) || amd_rdna) ? 1 : 0;
+ 
++    // GGML_VK_FA_SHMEM_STAGING=0|1 forces staging off/on to A/B it without a rebuild (still dropped below if it does not fit).
++    static const int fa_shmem_staging_env = ggml_vk_env_uint("GGML_VK_FA_SHMEM_STAGING", 0, 1);
++    if (fa_shmem_staging_env >= 0) {
++        result.shmem_staging = fa_shmem_staging_env != 0;
++    }
++
+     if (!reduce_block_rows && result.block_rows > 1 && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
+         result.block_rows /= 2;
+     }
+@@ -3241,6 +3263,20 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA1) {
+         rm_kq = 4;
+     }
++    // Runtime overrides, to sweep the row counts on a given board without a rebuild.
++    {
++        const int env_stdq = ggml_vk_env_uint("GGML_VK_RM_STDQ", 1, 8);
++        const int env_kq   = ggml_vk_env_uint("GGML_VK_RM_KQ",   1, 16);
++        const int env_iq   = ggml_vk_env_uint("GGML_VK_RM_IQ",   1, 16);
++        if (env_stdq > 0) { rm_stdq = (uint32_t) env_stdq; }
++        if (env_kq   > 0) { rm_kq   = (uint32_t) env_kq; }
++        if (env_iq   > 0) { rm_iq   = (uint32_t) env_iq; }
++        static bool logged = false;
++        if (!logged && (env_stdq > 0 || env_kq > 0 || env_iq > 0 || device->architecture == AMD_RDNA1)) {
++            logged = true;
++            GGML_LOG_INFO("ggml_vulkan: mat-vec rows per workgroup: stdq=%u kq=%u iq=%u\n", rm_stdq, rm_kq, rm_iq);
++        }
++    }
+ 
+     const bool use_subgroups = device->subgroup_arithmetic;
+     // The Imagination proprietary compiler rejects the subgroup-only dequant mul_mat_vec
+-- 
+2.43.0
+

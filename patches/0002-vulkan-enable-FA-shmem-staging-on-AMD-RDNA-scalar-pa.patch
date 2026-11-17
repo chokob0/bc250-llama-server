@@ -1,0 +1,47 @@
+From afc97028b86c8375b964319d972382f0e575fa72 Mon Sep 17 00:00:00 2001
+From: Melon_USK <klaus@funfamefortune.com>
+Date: Sun, 6 Sep 2026 18:38:05 +0200
+Subject: [PATCH 2/4] vulkan: enable FA shmem staging on AMD RDNA (scalar path)
+
+Staging K/V through shared memory in the scalar flash-attention path was
+gated to NVIDIA in #19625. On AMD RDNA the same staging is a large win,
+including for head sizes >= 256 which the NVIDIA gate excludes:
+
+- gfx1013 (AMD BC-250, RADV, Mesa 25.2.6), gemma-4-26B-A4B IQ3_S
+  (hsk/hsv 256 SWA / 512 global): pp2048 +12% at d0, +34% at d4096,
+  +50% at d8192 vs stock (b10727). In a 5-node RPC cluster running
+  Qwen3.5-122B-A10B: prefill 96 -> 162 t/s, generation 19 -> 29.5 t/s.
+- RDNA2 V620, 27B dense Q6_K (reported in #25207): +30% at d8192,
+  +62% at d16384.
+
+GCN is left unchanged (untested). The coopmat1 path is not touched.
+
+Ref: #25207
+(cherry picked from commit ee805c33733cefc8ad562be4d62b9e8f0ed192a6)
+(cherry picked from commit 479b09a9a528576a63e587afdccfd3ab141af112)
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 501ca9749..4a6ca10aa 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1256,7 +1256,13 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device,
+ 
+     result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
+ 
+-    result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
++    // Staging K/V through shared memory was gated to NVIDIA when introduced (#19625).
++    // On AMD RDNA (scalar FA path, no coopmat) it is a large win as well, including for
++    // head sizes >= 256: measured on gfx1013 (BC-250) with gemma-4-26B-A4B (hsk/hsv 256/512)
++    // pp2048 +12% at d0, +34% at d4096, +50% at d8192, and on an RDNA2 V620 with a 27B dense
++    // model +30% at d8192 / +62% at d16384 (issue #25207). GCN is left untouched (untested).
++    const bool amd_rdna = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN;
++    result.shmem_staging = ((device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) || amd_rdna) ? 1 : 0;
+ 
+     if (!reduce_block_rows && result.block_rows > 1 && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
+         result.block_rows /= 2;
+-- 
+2.43.0
+
